@@ -1,0 +1,6 @@
+{
+  "enabled": true,
+  "service": "Wi-Fi",
+  "host": "100.0.0.1",
+  "port": "7810"
+}
