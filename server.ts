@@ -144,6 +144,78 @@ async function serviceStatus(service: string): Promise<ServiceStatus> {
   return { service, http, https };
 }
 
+async function defaultInterface() {
+  const output = await runCommand(ROUTE, ["-n", "get", "default"]);
+  const line = output.split("\n").find((item) => item.trim().startsWith("interface:"));
+  return line?.split(":").slice(1).join(":").trim() || "en0";
+}
+
+async function readInterfaceBytes(name: string): Promise<InterfaceBytes> {
+  const output = await runCommand(NETSTAT, ["-ibn"]);
+  const line = output
+    .split("\n")
+    .map((item) => item.trim())
+    .find((item) => item.startsWith(`${name} `) && item.includes("<Link#"));
+
+  if (!line) {
+    throw new Error(`没有找到网卡 ${name} 的流量数据`);
+  }
+
+  const parts = line.split(/\s+/);
+  const receivedBytes = Number(parts[6]);
+  const sentBytes = Number(parts[9]);
+
+  if (!Number.isFinite(receivedBytes) || !Number.isFinite(sentBytes)) {
+    throw new Error(`网卡 ${name} 的流量数据解析失败`);
+  }
+
+  return { name, receivedBytes, sentBytes };
+}
+
+async function sampleTraffic() {
+  const name = await defaultInterface();
+  const current = await readInterfaceBytes(name);
+  const now = Date.now();
+
+  if (lastInterfaceBytes && lastInterfaceBytes.name === current.name) {
+    const seconds = Math.max((now - lastInterfaceBytes.time) / 1000, 1);
+    const receivedDelta = Math.max(current.receivedBytes - lastInterfaceBytes.receivedBytes, 0);
+    const sentDelta = Math.max(current.sentBytes - lastInterfaceBytes.sentBytes, 0);
+
+    trafficHistory.push({
+      time: now,
+      receivedBytesPerSecond: Math.round(receivedDelta / seconds),
+      sentBytesPerSecond: Math.round(sentDelta / seconds)
+    });
+
+    if (trafficHistory.length > TRAFFIC_HISTORY_LIMIT) {
+      trafficHistory = trafficHistory.slice(-TRAFFIC_HISTORY_LIMIT);
+    }
+  }
+
+  lastInterfaceBytes = { ...current, time: now };
+
+  return {
+    interface: current.name,
+    receivedBytes: current.receivedBytes,
+    sentBytes: current.sentBytes,
+    history: trafficHistory
+  };
+}
+
+async function currentTraffic() {
+  if (!lastInterfaceBytes) {
+    return await sampleTraffic();
+  }
+
+  return {
+    interface: lastInterfaceBytes.name,
+    receivedBytes: lastInterfaceBytes.receivedBytes,
+    sentBytes: lastInterfaceBytes.sentBytes,
+    history: trafficHistory
+  };
+}
+
 function proxyMatches(status: ServiceStatus, host: string, port: string) {
   return (
     status.http.enabled &&
@@ -187,6 +259,14 @@ setInterval(() => {
 }, ENFORCE_INTERVAL_MS);
 
 enforceDesiredProxy().catch(() => {});
+
+setInterval(() => {
+  sampleTraffic().catch((error) => {
+    console.error("流量采样失败:", error instanceof Error ? error.message : error);
+  });
+}, 1000);
+
+sampleTraffic().catch(() => {});
 
 function validateService(service: unknown, services: string[]) {
   if (typeof service !== "string" || !service.trim()) {
@@ -241,6 +321,10 @@ async function handleApi(request: Request, pathname: string) {
     const status = await serviceStatus(service);
     const desired = await readDesiredState();
     return json({ ok: true, data: { status, desired } });
+  }
+
+  if (request.method === "GET" && pathname === "/api/traffic") {
+    return json({ ok: true, data: await currentTraffic() });
   }
 
   if (request.method === "POST" && pathname === "/api/proxy") {
@@ -511,6 +595,69 @@ const INDEX_HTML = `<!doctype html>
         color: var(--green);
       }
 
+      .traffic {
+        margin-top: 18px;
+        border-top: 1px solid var(--line);
+        padding-top: 18px;
+      }
+
+      .traffic-head {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+        align-items: center;
+        margin-bottom: 12px;
+      }
+
+      .traffic-title {
+        font-size: 15px;
+        font-weight: 760;
+      }
+
+      .traffic-meta {
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .traffic-chart {
+        width: 100%;
+        height: 220px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: #fbfcfe;
+        display: block;
+        cursor: crosshair;
+      }
+
+      .traffic-legend {
+        display: flex;
+        gap: 16px;
+        flex-wrap: wrap;
+        margin-top: 10px;
+        color: var(--muted);
+        font-size: 13px;
+      }
+
+      .legend-item {
+        display: inline-flex;
+        align-items: center;
+        gap: 6px;
+      }
+
+      .legend-dot {
+        width: 10px;
+        height: 10px;
+        border-radius: 999px;
+      }
+
+      .legend-dot.down {
+        background: var(--blue);
+      }
+
+      .legend-dot.up {
+        background: var(--green);
+      }
+
       @media (max-width: 760px) {
         main {
           width: min(100vw - 24px, 880px);
@@ -569,6 +716,18 @@ const INDEX_HTML = `<!doctype html>
           </div>
         </div>
 
+        <div class="traffic">
+          <div class="traffic-head">
+            <div class="traffic-title">实时流量</div>
+            <div id="trafficMeta" class="traffic-meta">读取中</div>
+          </div>
+          <canvas id="trafficChart" class="traffic-chart"></canvas>
+          <div class="traffic-legend">
+            <span class="legend-item"><span class="legend-dot down"></span>下载 <span id="downloadRate">0 B/s</span></span>
+            <span class="legend-item"><span class="legend-dot up"></span>上传 <span id="uploadRate">0 B/s</span></span>
+          </div>
+        </div>
+
         <div id="message" class="message"></div>
       </section>
     </main>
@@ -581,6 +740,10 @@ const INDEX_HTML = `<!doctype html>
         statusPill: document.querySelector("#statusPill"),
         httpValue: document.querySelector("#httpValue"),
         httpsValue: document.querySelector("#httpsValue"),
+        trafficMeta: document.querySelector("#trafficMeta"),
+        trafficChart: document.querySelector("#trafficChart"),
+        downloadRate: document.querySelector("#downloadRate"),
+        uploadRate: document.querySelector("#uploadRate"),
         message: document.querySelector("#message"),
         enableBtn: document.querySelector("#enableBtn"),
         disableBtn: document.querySelector("#disableBtn"),
@@ -588,6 +751,8 @@ const INDEX_HTML = `<!doctype html>
       };
 
       let busy = false;
+      let trafficHistory = [];
+      let trafficHover = null;
 
       function setBusy(value) {
         busy = value;
@@ -612,6 +777,204 @@ const INDEX_HTML = `<!doctype html>
       function proxyText(item) {
         if (!item.enabled) return "关闭";
         return item.server && item.port ? item.server + ":" + item.port : "开启";
+      }
+
+      function formatRate(bytes) {
+        const units = ["B/s", "KB/s", "MB/s", "GB/s"];
+        let value = Math.max(Number(bytes) || 0, 0);
+        let index = 0;
+        while (value >= 1024 && index < units.length - 1) {
+          value = value / 1024;
+          index += 1;
+        }
+        return (index === 0 ? value.toFixed(0) : value.toFixed(1)) + " " + units[index];
+      }
+
+      function drawLine(ctx, points, maxValue, width, height, color, key) {
+        ctx.beginPath();
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2;
+
+        points.forEach((point, index) => {
+          const x = points.length <= 1 ? width : (index / (points.length - 1)) * width;
+          const y = height - (Math.max(point[key], 0) / maxValue) * height;
+          if (index === 0) {
+            ctx.moveTo(x, y);
+          } else {
+            ctx.lineTo(x, y);
+          }
+        });
+
+        ctx.stroke();
+      }
+
+      function formatClock(time) {
+        return new Date(time).toLocaleTimeString("zh-CN", {
+          hour12: false,
+          hour: "2-digit",
+          minute: "2-digit",
+          second: "2-digit"
+        });
+      }
+
+      function pointPosition(index, pointsLength, chartWidth, chartHeight, maxValue, value) {
+        const x = pointsLength <= 1 ? chartWidth : (index / (pointsLength - 1)) * chartWidth;
+        const y = chartHeight - (Math.max(value, 0) / maxValue) * chartHeight;
+        return { x, y };
+      }
+
+      function roundedRect(ctx, x, y, width, height, radius) {
+        ctx.beginPath();
+        ctx.moveTo(x + radius, y);
+        ctx.lineTo(x + width - radius, y);
+        ctx.quadraticCurveTo(x + width, y, x + width, y + radius);
+        ctx.lineTo(x + width, y + height - radius);
+        ctx.quadraticCurveTo(x + width, y + height, x + width - radius, y + height);
+        ctx.lineTo(x + radius, y + height);
+        ctx.quadraticCurveTo(x, y + height, x, y + height - radius);
+        ctx.lineTo(x, y + radius);
+        ctx.quadraticCurveTo(x, y, x + radius, y);
+        ctx.closePath();
+      }
+
+      function drawTrafficChart(history) {
+        const canvas = els.trafficChart;
+        const ratio = window.devicePixelRatio || 1;
+        const rect = canvas.getBoundingClientRect();
+        canvas.width = Math.max(Math.floor(rect.width * ratio), 1);
+        canvas.height = Math.max(Math.floor(rect.height * ratio), 1);
+
+        const ctx = canvas.getContext("2d");
+        ctx.scale(ratio, ratio);
+
+        const width = rect.width;
+        const height = rect.height;
+        const padding = { top: 22, right: 18, bottom: 34, left: 66 };
+        const chartWidth = width - padding.left - padding.right;
+        const chartHeight = height - padding.top - padding.bottom;
+        const points = history.slice(-60);
+        const maxValue = Math.max(
+          1024,
+          ...points.map((item) => item.receivedBytesPerSecond),
+          ...points.map((item) => item.sentBytesPerSecond)
+        );
+
+        ctx.clearRect(0, 0, width, height);
+
+        ctx.fillStyle = "#fbfcfe";
+        ctx.fillRect(0, 0, width, height);
+
+        ctx.strokeStyle = "#e6eaf0";
+        ctx.lineWidth = 1;
+        for (let i = 0; i <= 4; i += 1) {
+          const y = padding.top + (chartHeight / 4) * i;
+          const value = maxValue - (maxValue / 4) * i;
+          ctx.beginPath();
+          ctx.moveTo(padding.left, y);
+          ctx.lineTo(width - padding.right, y);
+          ctx.stroke();
+          ctx.fillStyle = "#667085";
+          ctx.font = "11px system-ui";
+          ctx.textAlign = "right";
+          ctx.textBaseline = "middle";
+          ctx.fillText(formatRate(value), padding.left - 8, y);
+        }
+
+        ctx.strokeStyle = "#cfd6e2";
+        ctx.beginPath();
+        ctx.moveTo(padding.left, padding.top);
+        ctx.lineTo(padding.left, height - padding.bottom);
+        ctx.lineTo(width - padding.right, height - padding.bottom);
+        ctx.stroke();
+
+        if (!points.length) return;
+
+        const xTickIndexes = [0, Math.floor((points.length - 1) / 2), points.length - 1].filter(
+          (value, index, array) => array.indexOf(value) === index
+        );
+        ctx.fillStyle = "#667085";
+        ctx.font = "11px system-ui";
+        ctx.textAlign = "center";
+        ctx.textBaseline = "top";
+        for (const index of xTickIndexes) {
+          const x = padding.left + pointPosition(index, points.length, chartWidth, chartHeight, maxValue, 0).x;
+          ctx.fillText(formatClock(points[index].time), x, height - padding.bottom + 8);
+        }
+
+        ctx.save();
+        ctx.translate(padding.left, padding.top);
+        drawLine(ctx, points, maxValue, chartWidth, chartHeight, "#2563eb", "receivedBytesPerSecond");
+        drawLine(ctx, points, maxValue, chartWidth, chartHeight, "#138a52", "sentBytesPerSecond");
+        ctx.restore();
+
+        if (trafficHover) {
+          const hoverX = Math.min(Math.max(trafficHover.x - padding.left, 0), chartWidth);
+          const index = Math.round((hoverX / chartWidth) * (points.length - 1));
+          const point = points[index];
+          const x = padding.left + pointPosition(index, points.length, chartWidth, chartHeight, maxValue, 0).x;
+          const down = pointPosition(index, points.length, chartWidth, chartHeight, maxValue, point.receivedBytesPerSecond);
+          const up = pointPosition(index, points.length, chartWidth, chartHeight, maxValue, point.sentBytesPerSecond);
+
+          ctx.strokeStyle = "rgba(23, 32, 42, 0.36)";
+          ctx.setLineDash([4, 4]);
+          ctx.beginPath();
+          ctx.moveTo(x, padding.top);
+          ctx.lineTo(x, height - padding.bottom);
+          ctx.stroke();
+          ctx.setLineDash([]);
+
+          ctx.fillStyle = "#2563eb";
+          ctx.beginPath();
+          ctx.arc(padding.left + down.x, padding.top + down.y, 4, 0, Math.PI * 2);
+          ctx.fill();
+
+          ctx.fillStyle = "#138a52";
+          ctx.beginPath();
+          ctx.arc(padding.left + up.x, padding.top + up.y, 4, 0, Math.PI * 2);
+          ctx.fill();
+
+          const lines = [
+            formatClock(point.time),
+            "下载 " + formatRate(point.receivedBytesPerSecond),
+            "上传 " + formatRate(point.sentBytesPerSecond)
+          ];
+          ctx.font = "12px system-ui";
+          const boxWidth = Math.max(...lines.map((line) => ctx.measureText(line).width)) + 18;
+          const boxHeight = 68;
+          const boxX = Math.min(Math.max(x + 10, 8), width - boxWidth - 8);
+          const boxY = Math.min(Math.max(padding.top + 8, 8), height - boxHeight - 8);
+
+          ctx.fillStyle = "rgba(255, 255, 255, 0.96)";
+          ctx.strokeStyle = "#d9dee7";
+          ctx.lineWidth = 1;
+          roundedRect(ctx, boxX, boxY, boxWidth, boxHeight, 6);
+          ctx.fill();
+          ctx.stroke();
+
+          ctx.fillStyle = "#17202a";
+          ctx.textAlign = "left";
+          ctx.textBaseline = "top";
+          lines.forEach((line, lineIndex) => {
+            ctx.fillText(line, boxX + 9, boxY + 8 + lineIndex * 18);
+          });
+        }
+      }
+
+      async function refreshTraffic() {
+        try {
+          const data = await api("/api/traffic");
+          const latest = data.history[data.history.length - 1] || {
+            receivedBytesPerSecond: 0,
+            sentBytesPerSecond: 0
+          };
+          els.trafficMeta.textContent = "网卡 " + data.interface;
+          els.downloadRate.textContent = formatRate(latest.receivedBytesPerSecond);
+          els.uploadRate.textContent = formatRate(latest.sentBytesPerSecond);
+          trafficHistory = data.history;
+          drawTrafficChart(trafficHistory);
+        } catch (error) {
+          els.trafficMeta.textContent = "流量读取失败";
+        }
       }
 
       function renderStatus(status) {
@@ -715,8 +1078,22 @@ const INDEX_HTML = `<!doctype html>
       els.refreshBtn.addEventListener("click", refreshStatus);
       els.enableBtn.addEventListener("click", enableProxy);
       els.disableBtn.addEventListener("click", disableProxy);
+      els.trafficChart.addEventListener("mousemove", (event) => {
+        const rect = els.trafficChart.getBoundingClientRect();
+        trafficHover = {
+          x: event.clientX - rect.left,
+          y: event.clientY - rect.top
+        };
+        drawTrafficChart(trafficHistory);
+      });
+      els.trafficChart.addEventListener("mouseleave", () => {
+        trafficHover = null;
+        drawTrafficChart(trafficHistory);
+      });
 
       loadInitial();
+      refreshTraffic();
+      setInterval(refreshTraffic, 1000);
     </script>
   </body>
 </html>`;
